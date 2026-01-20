@@ -90,6 +90,8 @@ class PatchedSourceDeductionService implements SourceDeductionServiceInterface
      */
     public function execute(SourceDeductionRequestInterface $sourceDeductionRequest): void
     {
+        $originalStockStatuses = [];
+
         $sourceCode = $sourceDeductionRequest->getSourceCode();
         $salesChannel = $sourceDeductionRequest->getSalesChannel();
         $stockId = $this->getStockBySalesChannel->execute($salesChannel)->getStockId();
@@ -108,6 +110,7 @@ class PatchedSourceDeductionService implements SourceDeductionServiceInterface
             }
 
             $sourceItem = $this->getSourceItemBySourceCodeAndSku->execute($sourceCode, $itemSku);
+            $originalStockStatuses[$itemSku] = $sourceItem->getStatus();
 
             /*
              * Ampersand change start
@@ -151,37 +154,52 @@ class PatchedSourceDeductionService implements SourceDeductionServiceInterface
         }
 
         if (!empty($sourceItemDecrementData)) {
-            $productIdsToClear = [];
             $this->decrementSourceItemFactory->create()->execute($sourceItemDecrementData);
+            $this->handleCacheClean($sourceItemDecrementData, $originalStockStatuses);
+        }
+    }
 
-            // calculate product ids to clear
-            foreach ($sourceItemDecrementData as $sourceItemDecrementDatum) {
-                if (!isset($sourceItemDecrementDatum['source_item'])) {
-                    continue;
-                }
-                $sourceItem = $sourceItemDecrementDatum['source_item'];
-                if ($sourceItem->getStatus()) {
-                    continue; // we only process caches when the stock status goes to 0
-                }
-                $sku = $sourceItem->getData('sku');
-                if (!$sku) {
-                    continue;
-                }
-                // pulls from internal cache so no performance hit on re-fetch
-                $legacyStockItem = $this->getLegacyStockItem->execute($sku);
-                if (!$legacyStockItem) {
-                    continue;
-                }
-                $productId = $legacyStockItem->getData('product_id');
-                if ($productId) {
-                    $productIdsToClear[] = $productId;
-                }
-            }
+    /**
+     * Clean the cache when a products stock status changes
+     *
+     * @param array $sourceItemDecrementData
+     * @param array $originalStockStatuses
+     * @return void
+     */
+    private function handleCacheClean(array $sourceItemDecrementData, array $originalStockStatuses)
+    {
+        $productIdsToClear = [];
 
-            if (!empty($productIdsToClear)) {
-                $this->cacheContext->registerEntities(ProductModel::CACHE_TAG, $productIdsToClear);
-                $this->eventManager->dispatch('clean_cache_by_tags', ['object' => $this->cacheContext]);
+        // calculate product ids to clear
+        foreach ($sourceItemDecrementData as $sourceItemDecrementDatum) {
+            if (!isset($sourceItemDecrementDatum['source_item'])) {
+                continue;
             }
+            $sourceItem = $sourceItemDecrementDatum['source_item'];
+            $sku = $sourceItem->getData('sku');
+            if (!$sku) {
+                continue;
+            }
+            if (!isset($originalStockStatuses[$sku])) {
+                continue;
+            }
+            if ($sourceItem->getStatus() == $originalStockStatuses[$sku]) {
+                continue; // we only process caches when the stock status changes
+            }
+            // pulls from internal cache so no performance hit on re-fetch
+            $legacyStockItem = $this->getLegacyStockItem->execute($sku);
+            if (!$legacyStockItem) {
+                continue;
+            }
+            $productId = $legacyStockItem->getData('product_id');
+            if ($productId) {
+                $productIdsToClear[] = $productId;
+            }
+        }
+
+        if (!empty($productIdsToClear)) {
+            $this->cacheContext->registerEntities(ProductModel::CACHE_TAG, $productIdsToClear);
+            $this->eventManager->dispatch('clean_cache_by_tags', ['object' => $this->cacheContext]);
         }
     }
 
