@@ -3,10 +3,14 @@ declare(strict_types=1);
 namespace Ampersand\DisableStockReservation\Model\SourceDeductionService;
 
 use Ampersand\DisableStockReservation\Model\SourceItem\Command\DecrementSourceItemQtyFactory;
+use Magento\Catalog\Model\Product as ProductModel;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\Event\ManagerInterface as EventManager;
+use Magento\Framework\Indexer\CacheContext;
 use Magento\InventoryApi\Api\Data\SourceItemInterface;
 use Magento\InventoryConfigurationApi\Api\Data\StockItemConfigurationInterface;
 use Magento\InventoryConfigurationApi\Api\GetStockItemConfigurationInterface;
+use Magento\InventoryConfiguration\Model\GetLegacyStockItem;
 use Magento\InventorySalesApi\Api\GetStockBySalesChannelInterface;
 use Magento\InventorySourceDeductionApi\Model\GetSourceItemBySourceCodeAndSku;
 use Magento\InventorySourceDeductionApi\Model\SourceDeductionRequestInterface;
@@ -40,21 +44,45 @@ class PatchedSourceDeductionService implements SourceDeductionServiceInterface
     private $decrementSourceItemFactory;
 
     /**
+     * @var GetLegacyStockItem
+     */
+    private $getLegacyStockItem;
+
+    /**
+     * @var CacheContext
+     */
+    private $cacheContext;
+
+    /**
+     * @var EventManager
+     */
+    private $eventManager;
+
+    /**
      * @param GetSourceItemBySourceCodeAndSku $getSourceItemBySourceCodeAndSku
      * @param GetStockItemConfigurationInterface $getStockItemConfiguration
      * @param GetStockBySalesChannelInterface $getStockBySalesChannel
      * @param DecrementSourceItemQtyFactory $decrementSourceItemFactory
+     * @param GetLegacyStockItem $getLegacyStockItem
+     * @param CacheContext $cacheContext
+     * @param EventManager $eventManager
      */
     public function __construct(
         GetSourceItemBySourceCodeAndSku $getSourceItemBySourceCodeAndSku,
         GetStockItemConfigurationInterface $getStockItemConfiguration,
         GetStockBySalesChannelInterface $getStockBySalesChannel,
-        DecrementSourceItemQtyFactory $decrementSourceItemFactory
+        DecrementSourceItemQtyFactory $decrementSourceItemFactory,
+        GetLegacyStockItem $getLegacyStockItem,
+        CacheContext $cacheContext,
+        EventManager $eventManager
     ) {
         $this->getSourceItemBySourceCodeAndSku = $getSourceItemBySourceCodeAndSku;
         $this->getStockItemConfiguration = $getStockItemConfiguration;
         $this->getStockBySalesChannel = $getStockBySalesChannel;
         $this->decrementSourceItemFactory = $decrementSourceItemFactory;
+        $this->getLegacyStockItem = $getLegacyStockItem;
+        $this->cacheContext = $cacheContext;
+        $this->eventManager = $eventManager;
     }
 
     /**
@@ -123,7 +151,37 @@ class PatchedSourceDeductionService implements SourceDeductionServiceInterface
         }
 
         if (!empty($sourceItemDecrementData)) {
+            $productIdsToClear = [];
             $this->decrementSourceItemFactory->create()->execute($sourceItemDecrementData);
+
+            // calculate product ids to clear
+            foreach ($sourceItemDecrementData as $sourceItemDecrementDatum) {
+                if (!isset($sourceItemDecrementDatum['source_item'])) {
+                    continue;
+                }
+                $sourceItem = $sourceItemDecrementDatum['source_item'];
+                if ($sourceItem->getStatus()) {
+                    continue; // we only process caches when the stock status goes to 0
+                }
+                $sku = $sourceItem->getData('sku');
+                if (!$sku) {
+                    continue;
+                }
+                // pulls from internal cache so no performance hit on re-fetch
+                $legacyStockItem = $this->getLegacyStockItem->execute($sku);
+                if (!$legacyStockItem) {
+                    continue;
+                }
+                $productId = $legacyStockItem->getData('product_id');
+                if ($productId) {
+                    $productIdsToClear[] = $productId;
+                }
+            }
+
+            if (!empty($productIdsToClear)) {
+                $this->cacheContext->registerEntities(ProductModel::CACHE_TAG, $productIdsToClear);
+                $this->eventManager->dispatch('clean_cache_by_tags', ['object' => $this->cacheContext]);
+            }
         }
     }
 
